@@ -176,14 +176,24 @@ def rule_based_sql(q: str):
     if quarter:
         where.append(f"quarter = {quarter}")
 
-    is_order_count = bool(re.search(r"\b(how many orders|number of orders|total orders|order count)\b", q_lower))
-    is_unique_cust = bool(re.search(r"\b(distinct|unique)\s+customers?\b|\bhow many (unique |distinct )?customers\b", q_lower))
+    is_unique_cust = bool(re.search(r"\b(distinct|unique)\s+customers?\b|\bhow many (unique |distinct )?customers\b|\bcount.*customers\b", q_lower))
     is_top_prod = bool(re.search(r"\b(which|top|most (popular|sold|common))\s+product\b", q_lower))
     is_top_cust = bool(re.search(r"\b(which|top|highest spending)\s+customer\b", q_lower))
     is_top_region = bool(re.search(r"\b(which|top|highest)\s+region\b", q_lower))
-    is_unit_qty = bool(re.search(r"\b(quantity|units? sold|how many (units?|items?))\b", q_lower))
+    is_unit_qty = bool(re.search(r"\b(quantity|units? sold|how many (units?|items?)|total units?)\b", q_lower))
+    
+    # Catch both "Count the refunded South orders..." and "How many orders..."
+    is_order_count = bool(re.search(r"\bcount\b.*\borders?\b|\b(how many|number of|total)\s+orders?\b", q_lower)) or (
+        bool(re.search(r"^\s*count\b", q_lower)) and not bool(re.search(r"\b(dollars?|usd|revenue|amount)\b", q_lower))
+    )
+    
     is_refund = bool(re.search(r"\brefunds?\b|\brefunded\b", q_lower))
     is_revenue = bool(re.search(r"\brevenue\b|\bearn(ed|s)?\b|\bsales?\b|\bgross\b|\bmade\b|\bspent\b|\bspend\b|\bincome\b", q_lower))
+
+    if is_unique_cust:
+        where.append("status = 'paid'")
+        where_str = " AND ".join(where) if where else "1=1"
+        return f"SELECT COUNT(DISTINCT customer) FROM orders WHERE {where_str}"
 
     if is_order_count:
         if is_refund:
@@ -195,31 +205,26 @@ def rule_based_sql(q: str):
         where_str = " AND ".join(where) if where else "1=1"
         return f"SELECT COUNT(*) FROM orders WHERE {where_str}"
 
-    if is_unique_cust:
-        where.append("status = 'paid'")
-        where_str = " AND ".join(where)
-        return f"SELECT COUNT(DISTINCT customer) FROM orders WHERE {where_str}"
-
     if is_top_prod:
         where.append("status = 'paid'")
-        where_str = " AND ".join(where)
+        where_str = " AND ".join(where) if where else "1=1"
         if is_unit_qty or "quantity" in q_lower or "units" in q_lower:
             return f"SELECT product FROM orders WHERE {where_str} GROUP BY product ORDER BY SUM(qty) DESC LIMIT 1"
         return f"SELECT product FROM orders WHERE {where_str} GROUP BY product ORDER BY SUM(amount_usd) DESC LIMIT 1"
 
     if is_top_cust:
         where.append("status = 'paid'")
-        where_str = " AND ".join(where)
+        where_str = " AND ".join(where) if where else "1=1"
         return f"SELECT customer FROM orders WHERE {where_str} GROUP BY customer ORDER BY SUM(amount_usd) DESC LIMIT 1"
 
     if is_top_region:
         where.append("status = 'paid'")
-        where_str = " AND ".join(where)
+        where_str = " AND ".join(where) if where else "1=1"
         return f"SELECT region FROM orders WHERE {where_str} GROUP BY region ORDER BY SUM(amount_usd) DESC LIMIT 1"
 
     if is_unit_qty:
         where.append("status = 'paid'")
-        where_str = " AND ".join(where)
+        where_str = " AND ".join(where) if where else "1=1"
         return f"SELECT SUM(qty) FROM orders WHERE {where_str}"
 
     if is_refund:
@@ -227,7 +232,7 @@ def rule_based_sql(q: str):
         where_str = " AND ".join(where) if where else "1=1"
         return f"SELECT ROUND(SUM(amount_usd), 2) FROM orders WHERE {where_str}"
 
-    if is_revenue:
+    if is_revenue or "how much" in q_lower or "total" in q_lower or "usd" in q_lower or "dollar" in q_lower:
         where.append("status = 'paid'")
         where_str = " AND ".join(where) if where else "1=1"
         return f"SELECT ROUND(SUM(amount_usd), 2) FROM orders WHERE {where_str}"
