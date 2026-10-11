@@ -15,7 +15,7 @@ from google.genai import types
 app = FastAPI(title="Acme Appliances Ledger Agent")
 
 DATA_FILE = Path(__file__).with_name("ledger_export.ndjson")
-MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+MODELS = ["gemini-flash-latest", "gemini-3.8-flash"]
 IST = ZoneInfo("Asia/Kolkata")
 
 USD_PER_UNIT = {
