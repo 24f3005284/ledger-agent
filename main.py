@@ -1,10 +1,9 @@
-
 import json
 import os
 import re
+import sqlite3
 import traceback
-from collections import defaultdict
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -16,7 +15,7 @@ from google.genai import types
 app = FastAPI(title="Acme Appliances Ledger Agent")
 
 DATA_FILE = Path(__file__).with_name("ledger_export.ndjson")
-MODEL = "gemini-3.8-flash"
+MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 IST = ZoneInfo("Asia/Kolkata")
 
 USD_PER_UNIT = {
@@ -25,313 +24,196 @@ USD_PER_UNIT = {
     "INR": 0.01145,
 }
 
-REGIONS = {"North", "South", "East", "West", "Central"}
-CURRENCIES = set(USD_PER_UNIT)
-STATUSES = {"paid", "refunded", "void", "all"}
-METRICS = {"revenue", "refunds", "count", "top_product"}
+# Connect in-memory SQLite database
+conn = sqlite3.connect(":memory:", check_same_thread=False)
 
-
-def load_orders():
-    """Load the latest version of each order from the NDJSON export."""
+def init_db():
     if not DATA_FILE.exists():
         raise FileNotFoundError(f"Ledger file not found: {DATA_FILE}")
 
     latest = {}
-
     with DATA_FILE.open("r", encoding="utf-8-sig") as file:
-        for line_number, line in enumerate(file, start=1):
-            if not line.strip():
+        for line in file:
+            line = line.strip()
+            if not line:
                 continue
+            order = json.loads(line)
+            oid = order["id"]
+            if oid not in latest or order["updated_at"] > latest[oid]["updated_at"]:
+                latest[oid] = order
 
-            try:
-                order = json.loads(line)
-                order_id = order["id"]
-                previous = latest.get(order_id)
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS orders (
+        id TEXT PRIMARY KEY,
+        customer TEXT,
+        region TEXT,
+        product TEXT,
+        qty INTEGER,
+        unit_price REAL,
+        amount REAL,
+        currency TEXT,
+        amount_usd REAL,
+        status TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        year INTEGER,
+        month INTEGER,
+        month_name TEXT,
+        quarter INTEGER,
+        date TEXT
+    )
+    """)
 
-                if (
-                    previous is None
-                    or order["updated_at"] > previous["updated_at"]
-                ):
-                    latest[order_id] = order
+    rows = []
+    for r in latest.values():
+        cr = datetime.fromisoformat(r["created_at"])
+        if cr.tzinfo is None:
+            cr = cr.replace(tzinfo=IST)
+        cr_ist = cr.astimezone(IST)
 
-            except (json.JSONDecodeError, KeyError) as exc:
-                raise ValueError(
-                    f"Invalid ledger record on line {line_number}"
-                ) from exc
+        up = datetime.fromisoformat(r["updated_at"])
+        if up.tzinfo is None:
+            up = up.replace(tzinfo=IST)
+        up_ist = up.astimezone(IST)
 
-    return list(latest.values())
+        rate = USD_PER_UNIT.get(r["currency"], 1.0)
+        amount_usd = float(r["amount"]) * rate
 
+        rows.append((
+            r["id"],
+            r["customer"],
+            r["region"],
+            r["product"],
+            int(r["qty"]),
+            float(r["unit_price"]),
+            float(r["amount"]),
+            r["currency"],
+            amount_usd,
+            r["status"],
+            cr_ist.isoformat(),
+            up_ist.isoformat(),
+            cr_ist.year,
+            cr_ist.month,
+            cr_ist.strftime("%B"),
+            (cr_ist.month - 1) // 3 + 1,
+            cr_ist.strftime("%Y-%m-%d")
+        ))
 
-ORDERS = load_orders()
-PRODUCTS = sorted({order["product"] for order in ORDERS})
+    cursor.executemany("INSERT OR REPLACE INTO orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    conn.commit()
+    print(f"Database initialized with {len(rows)} unique orders.")
 
+init_db()
 
 class Question(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
 
-
 def get_client():
-    """Create the Gemini client using the configured environment variable."""
     api_key = os.getenv("GEMINI_API_KEY")
-
     if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY is missing from the server environment"
-        )
-
+        raise RuntimeError("GEMINI_API_KEY is missing from the environment")
     return genai.Client(api_key=api_key)
 
+SQL_PROMPT_TEMPLATE = """You are an expert SQL engineer. Given a plain English question about an order ledger, write a single SQLite query for the `orders` table to answer it.
+Return ONLY the raw SQL query. Do not wrap in markdown (no ```sql). No explanations. No comments.
 
-def interpret_question(question: str) -> dict:
-    """Use Gemini to translate natural language into a structured query."""
-    client = get_client()
-
-    schema_description = {
-        "metric": "revenue, refunds, count, or top_product",
-        "region": "exact region name or null",
-        "product": "exact product name or null",
-        "customer_id": "customer ID such as C1132 or null",
-        "month": "integer 1-12 or null",
-        "year": "integer year or null",
-        "start_date": "YYYY-MM-DD or null",
-        "end_date": "YYYY-MM-DD or null",
-        "currency": "USD, EUR, or INR",
-        "status": "paid, refunded, void, or all",
-    }
-
-    prompt = f"""
-You convert questions about an order ledger into structured JSON queries.
-
-Return exactly one JSON object with these fields:
-{json.dumps(schema_description)}
+SQLite Schema:
+TABLE orders (
+    id TEXT,            -- e.g. 'ORD-11483'
+    customer TEXT,      -- customer ID, e.g. 'C1132'
+    region TEXT,        -- 'Central', 'East', 'North', 'South', 'West'
+    product TEXT,       -- 'Air Fryer', 'Blender', 'Grinder', 'Juicer', 'Kettle', 'Mixer', 'Rice Cooker', 'Toaster'
+    qty INTEGER,        -- quantity of units
+    unit_price REAL,    -- price per unit in local currency
+    amount REAL,        -- total amount in local currency
+    currency TEXT,      -- 'USD', 'EUR', 'INR'
+    amount_usd REAL,    -- amount in USD. ALWAYS use this for money, revenue, sales, and refunds!
+    status TEXT,        -- 'paid', 'refunded', 'void'
+    year INTEGER,       -- 2026
+    month INTEGER,      -- 1 to 12 (1=January, 2=February, 3=March, 4=April, 5=May, 6=June)
+    month_name TEXT,    -- 'January', 'February', 'March', 'April', 'May', 'June'
+    quarter INTEGER,    -- 1 (Jan-Mar) or 2 (Apr-Jun)
+    date TEXT           -- 'YYYY-MM-DD'
+);
 
 Rules:
-- Never return SQL, Python, code, or explanations.
-- revenue means the sum of paid order amounts.
-- refunds means the sum of refunded order amounts.
-- count means the number of matching orders.
-- top_product means the product with the largest total quantity.
-- A revenue question defaults to status paid.
-- A refund question uses metric refunds and status refunded.
-- For an order-count question, use the status explicitly requested.
-  If no status is specified, use all.
-- For a monetary question, default currency to USD unless another
-  currency is explicitly requested.
-- Use null for filters the user did not specify.
-- If a month and year are specified, populate both fields.
-- For date ranges, use inclusive start_date and end_date.
-- If the user asks about a particular customer, extract the customer ID.
-- If the question is ambiguous, choose the closest supported metric.
-- Use only the exact region and product names listed below.
+1. "Revenue", "sales", or customer spending ALWAYS means status = 'paid'. Sum amount_usd: ROUND(SUM(amount_usd), 2).
+2. "Refunds" or "refunded" ALWAYS means status = 'refunded'. Sum amount_usd: ROUND(SUM(amount_usd), 2).
+3. If asked for a product name, return the exact product name: SELECT product ...
+4. If asked for a customer ID, return the customer ID: SELECT customer ...
+5. If asked for unique/distinct customers, use COUNT(DISTINCT customer).
+6. If asked for total orders or number of orders, use COUNT(*).
+7. If asked for total quantity / units sold, use SUM(qty).
+8. If asked for top / most / highest, use ORDER BY ... DESC LIMIT 1.
+9. If asked for lowest / least, use ORDER BY ... ASC LIMIT 1.
+10. All monetary values must be rounded to 2 decimal places: ROUND(..., 2).
+11. Return a query that produces exactly 1 row and 1 column.
 
-Available regions: {json.dumps(sorted(REGIONS))}
-Available products: {json.dumps(PRODUCTS)}
-Available currencies: {json.dumps(sorted(CURRENCIES))}
+Question: {question}
+SQL:"""
 
-User question:
-{question}
-"""
+def generate_sql(question: str) -> str:
+    client = get_client()
+    prompt = SQL_PROMPT_TEMPLATE.format(question=question)
 
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0,
-        ),
-    )
+    last_error = None
+    for model_name in MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                ),
+            )
+            if response.text:
+                sql = response.text.strip()
+                sql = re.sub(r"^```sql", "", sql, flags=re.IGNORECASE)
+                sql = re.sub(r"^```", "", sql)
+                sql = re.sub(r"```$", "", sql).strip()
+                return sql.rstrip(";")
+        except Exception as e:
+            print(f"Model {model_name} failed: {e}")
+            last_error = e
 
-    if not response.text:
-        raise ValueError("Gemini returned an empty response")
-
-    query = json.loads(response.text)
-
-    if not isinstance(query, dict):
-        raise ValueError("Gemini did not return a JSON object")
-
-    if query.get("metric") not in METRICS:
-        raise ValueError("Gemini returned an unsupported metric")
-
-    region = query.get("region")
-    if region is not None and region not in REGIONS:
-        raise ValueError("Gemini returned an invalid region")
-
-    product = query.get("product")
-    if product is not None and product not in PRODUCTS:
-        raise ValueError("Gemini returned an invalid product")
-
-    currency = query.get("currency")
-    if currency not in CURRENCIES:
-        query["currency"] = "USD"
-
-    status = query.get("status")
-    if status not in STATUSES:
-        query["status"] = (
-            "refunded"
-            if query["metric"] == "refunds"
-            else "all" if query["metric"] == "count"
-            else "paid"
-        )
-
-    if query["metric"] == "refunds":
-        query["status"] = "refunded"
-
-    # Validate customer IDs before using them as filters.
-    customer_id = query.get("customer_id")
-    if customer_id is not None:
-        customer_id = str(customer_id).strip().upper()
-        if not re.fullmatch(r"C\d+", customer_id):
-            raise ValueError("Gemini returned an invalid customer ID")
-        query["customer_id"] = customer_id
-
-    # Validate dates and normalize numeric fields.
-    for field in ("month", "year"):
-        value = query.get(field)
-        if value is not None:
-            query[field] = int(value)
-
-    if query.get("month") is not None:
-        if query["month"] not in range(1, 13):
-            raise ValueError("Invalid month")
-        if query.get("year") is None:
-            raise ValueError("Month queries require a year")
-
-    if query.get("year") is not None:
-        if query["year"] not in range(2000, 2101):
-            raise ValueError("Invalid year")
-
-    for field in ("start_date", "end_date"):
-        value = query.get(field)
-        if value is not None:
-            date.fromisoformat(value)
-
-    return query
-
-
-def order_date(order):
-    return (
-        datetime.fromisoformat(order["created_at"])
-        .astimezone(IST)
-        .date()
-    )
-
-
-def amount_in_currency(order, target_currency):
-    """Convert the order's source currency using the supplied exchange rates."""
-    source_currency = order["currency"]
-
-    if source_currency not in USD_PER_UNIT:
-        raise ValueError(f"Unsupported source currency: {source_currency}")
-
-    amount_usd = float(order["amount"]) * USD_PER_UNIT[source_currency]
-    return amount_usd / USD_PER_UNIT[target_currency]
-
-
-def answer_query(query):
-    rows = ORDERS[:]
-
-    if query.get("region"):
-        rows = [
-            order for order in rows
-            if order["region"] == query["region"]
-        ]
-
-    if query.get("product"):
-        rows = [
-            order for order in rows
-            if order["product"] == query["product"]
-        ]
-
-    if query.get("customer_id"):
-        customer_id = query["customer_id"]
-        rows = [
-            order for order in rows
-            if order["customer"].upper() == customer_id
-        ]
-
-    month = query.get("month")
-    year = query.get("year")
-
-    if month is not None:
-        rows = [
-            order for order in rows
-            if order_date(order).month == month
-            and order_date(order).year == year
-        ]
-
-    start_date = query.get("start_date")
-    end_date = query.get("end_date")
-
-    if start_date:
-        start = date.fromisoformat(start_date)
-        rows = [order for order in rows if order_date(order) >= start]
-
-    if end_date:
-        end = date.fromisoformat(end_date)
-        rows = [order for order in rows if order_date(order) <= end]
-
-    status = query.get("status", "paid")
-
-    if status != "all":
-        rows = [
-            order for order in rows
-            if order["status"] == status
-        ]
-
-    metric = query["metric"]
-
-    if metric == "count":
-        return len(rows)
-
-    if metric == "top_product":
-        quantities = defaultdict(int)
-
-        for order in rows:
-            quantities[order["product"]] += int(order["qty"])
-
-        if not quantities:
-            return "No matching records"
-
-        return max(quantities, key=quantities.get)
-
-    currency = query.get("currency", "USD")
-
-    total = sum(
-        amount_in_currency(order, currency)
-        for order in rows
-    )
-
-    return round(total, 2)
-
+    raise last_error or RuntimeError("All Gemini models failed")
 
 @app.post("/")
 def solve(request: Question):
     try:
         print(f"Received question: {request.question}")
+        sql = generate_sql(request.question)
+        print(f"Generated SQL: {sql}")
 
-        query = interpret_question(request.question)
-        print(f"Structured query: {query}")
+        cursor = conn.cursor()
+        row = cursor.execute(sql).fetchone()
+        if not row:
+            raise ValueError("Query returned no results")
 
-        answer = answer_query(query)
-        print(f"Calculated answer: {answer}")
+        ans = row[0]
+        if isinstance(ans, float):
+            ans = round(ans, 2)
+        elif isinstance(ans, str):
+            ans = ans.strip()
 
-        return {"answer": answer}
+        print(f"Calculated answer: {ans}")
+        return {"answer": ans}
 
     except Exception as exc:
         print(f"Ledger Agent error: {type(exc).__name__}: {exc}")
         traceback.print_exc()
-
-        # Keep internal errors and credentials out of the public response.
         raise HTTPException(
             status_code=502,
-            detail="Unable to interpret or answer the question right now",
+            detail=f"Error answering question: {exc}",
         ) from exc
-
 
 @app.get("/")
 def health():
+    cursor = conn.cursor()
+    count = cursor.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
     return {
         "service": "Acme Appliances Ledger Agent",
-        "orders_loaded": len(ORDERS),
+        "orders_loaded": count,
         "llm_enabled": bool(os.getenv("GEMINI_API_KEY")),
     }
