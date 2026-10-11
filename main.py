@@ -208,6 +208,21 @@ def solve(request: Question):
             detail=f"Error answering question: {exc}",
         ) from exc
 
+@app.get("/test-llm")
+def test_llm():
+    client = get_client()
+    results = {}
+    for m in ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite"]:
+        try:
+            resp = client.models.generate_content(
+                model=m,
+                contents="SELECT 1;",
+            )
+            results[m] = {"ok": True, "text": resp.text}
+        except Exception as e:
+            results[m] = {"ok": False, "error": str(e)}
+    return results
+
 @app.get("/models")
 def list_models():
     try:
