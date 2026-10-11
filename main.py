@@ -208,6 +208,14 @@ def solve(request: Question):
             detail=f"Error answering question: {exc}",
         ) from exc
 
+@app.get("/models")
+def list_models():
+    try:
+        client = get_client()
+        return {"models": [m.name for m in client.models.list()]}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/")
 def health():
     cursor = conn.cursor()
