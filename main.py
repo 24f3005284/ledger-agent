@@ -24,7 +24,24 @@ USD_PER_UNIT = {
     "INR": 0.01145,
 }
 
-# Connect in-memory SQLite database
+MONTHS = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12
+}
+
+REGIONS = ["Central", "East", "North", "South", "West"]
+PRODUCTS = ["Air Fryer", "Rice Cooker", "Blender", "Grinder", "Juicer", "Kettle", "Mixer", "Toaster"]
+
 conn = sqlite3.connect(":memory:", check_same_thread=False)
 
 def init_db():
@@ -109,6 +126,114 @@ init_db()
 class Question(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
 
+def rule_based_sql(q: str):
+    q_lower = q.lower()
+    
+    region = None
+    for r in REGIONS:
+        if re.search(r"\b" + r.lower() + r"\b", q_lower):
+            region = r
+            break
+            
+    product = None
+    for p in PRODUCTS:
+        if re.search(r"\b" + p.lower() + r"s?\b", q_lower):
+            product = p
+            break
+            
+    customer = None
+    m_cust = re.search(r"\b(C\d+)\b", q, re.IGNORECASE)
+    if m_cust:
+        customer = m_cust.group(1).upper()
+        
+    year = None
+    m_yr = re.search(r"\b(202[0-9])\b", q)
+    if m_yr:
+        year = int(m_yr.group(1))
+        
+    month = None
+    for m_name, m_num in MONTHS.items():
+        if re.search(r"\b" + m_name + r"\b", q_lower):
+            month = m_num
+            break
+            
+    quarter = None
+    m_q = re.search(r"\bq([1-4])\b|\bquarter\s*([1-4])\b", q_lower)
+    if m_q:
+        quarter = int(m_q.group(1) or m_q.group(2))
+
+    where = []
+    if region:
+        where.append(f"region = '{region}'")
+    if product:
+        where.append(f"product = '{product}'")
+    if customer:
+        where.append(f"customer = '{customer}'")
+    if year:
+        where.append(f"year = {year}")
+    if month:
+        where.append(f"month = {month}")
+    if quarter:
+        where.append(f"quarter = {quarter}")
+
+    is_order_count = bool(re.search(r"\b(how many orders|number of orders|total orders|order count)\b", q_lower))
+    is_unique_cust = bool(re.search(r"\b(distinct|unique)\s+customers?\b|\bhow many (unique |distinct )?customers\b", q_lower))
+    is_top_prod = bool(re.search(r"\b(which|top|most (popular|sold|common))\s+product\b", q_lower))
+    is_top_cust = bool(re.search(r"\b(which|top|highest spending)\s+customer\b", q_lower))
+    is_top_region = bool(re.search(r"\b(which|top|highest)\s+region\b", q_lower))
+    is_unit_qty = bool(re.search(r"\b(quantity|units? sold|how many (units?|items?))\b", q_lower))
+    is_refund = bool(re.search(r"\brefunds?\b|\brefunded\b", q_lower))
+    is_revenue = bool(re.search(r"\brevenue\b|\bearn(ed|s)?\b|\bsales?\b|\bgross\b|\bmade\b|\bspent\b|\bspend\b|\bincome\b", q_lower))
+
+    if is_order_count:
+        if is_refund:
+            where.append("status = 'refunded'")
+        elif "paid" in q_lower:
+            where.append("status = 'paid'")
+        elif "void" in q_lower:
+            where.append("status = 'void'")
+        where_str = " AND ".join(where) if where else "1=1"
+        return f"SELECT COUNT(*) FROM orders WHERE {where_str}"
+
+    if is_unique_cust:
+        where.append("status = 'paid'")
+        where_str = " AND ".join(where)
+        return f"SELECT COUNT(DISTINCT customer) FROM orders WHERE {where_str}"
+
+    if is_top_prod:
+        where.append("status = 'paid'")
+        where_str = " AND ".join(where)
+        if is_unit_qty or "quantity" in q_lower or "units" in q_lower:
+            return f"SELECT product FROM orders WHERE {where_str} GROUP BY product ORDER BY SUM(qty) DESC LIMIT 1"
+        return f"SELECT product FROM orders WHERE {where_str} GROUP BY product ORDER BY SUM(amount_usd) DESC LIMIT 1"
+
+    if is_top_cust:
+        where.append("status = 'paid'")
+        where_str = " AND ".join(where)
+        return f"SELECT customer FROM orders WHERE {where_str} GROUP BY customer ORDER BY SUM(amount_usd) DESC LIMIT 1"
+
+    if is_top_region:
+        where.append("status = 'paid'")
+        where_str = " AND ".join(where)
+        return f"SELECT region FROM orders WHERE {where_str} GROUP BY region ORDER BY SUM(amount_usd) DESC LIMIT 1"
+
+    if is_unit_qty:
+        where.append("status = 'paid'")
+        where_str = " AND ".join(where)
+        return f"SELECT SUM(qty) FROM orders WHERE {where_str}"
+
+    if is_refund:
+        where.append("status = 'refunded'")
+        where_str = " AND ".join(where) if where else "1=1"
+        return f"SELECT ROUND(SUM(amount_usd), 2) FROM orders WHERE {where_str}"
+
+    if is_revenue:
+        where.append("status = 'paid'")
+        where_str = " AND ".join(where) if where else "1=1"
+        return f"SELECT ROUND(SUM(amount_usd), 2) FROM orders WHERE {where_str}"
+
+    return None
+
 def get_client():
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -131,7 +256,7 @@ TABLE orders (
     amount_usd REAL,    -- amount in USD. ALWAYS use this for money, revenue, sales, and refunds!
     status TEXT,        -- 'paid', 'refunded', 'void'
     year INTEGER,       -- 2026
-    month INTEGER,      -- 1 to 12 (1=January, 2=February, 3=March, 4=April, 5=May, 6=June)
+    month INTEGER,      -- 1 to 12
     month_name TEXT,    -- 'January', 'February', 'March', 'April', 'May', 'June'
     quarter INTEGER,    -- 1 (Jan-Mar) or 2 (Apr-Jun)
     date TEXT           -- 'YYYY-MM-DD'
@@ -154,6 +279,13 @@ Question: {question}
 SQL:"""
 
 def generate_sql(question: str) -> str:
+    # 1. Try instant deterministic parsing
+    fast_sql = rule_based_sql(question)
+    if fast_sql:
+        print(f"[FAST RULE] Generated SQL: {fast_sql}")
+        return fast_sql
+
+    # 2. Fallback to Gemini
     client = get_client()
     prompt = SQL_PROMPT_TEMPLATE.format(question=question)
 
@@ -172,32 +304,33 @@ def generate_sql(question: str) -> str:
                 sql = re.sub(r"^```sql", "", sql, flags=re.IGNORECASE)
                 sql = re.sub(r"^```", "", sql)
                 sql = re.sub(r"```$", "", sql).strip()
+                print(f"[LLM {model_name}] Generated SQL: {sql}")
                 return sql.rstrip(";")
         except Exception as e:
             print(f"Model {model_name} failed: {e}")
             last_error = e
 
-    raise last_error or RuntimeError("All Gemini models failed")
+    raise last_error or RuntimeError("Could not generate SQL")
 
 @app.post("/")
 def solve(request: Question):
     try:
         print(f"Received question: {request.question}")
         sql = generate_sql(request.question)
-        print(f"Generated SQL: {sql}")
 
         cursor = conn.cursor()
         row = cursor.execute(sql).fetchone()
-        if not row:
-            raise ValueError("Query returned no results")
+        if not row or row[0] is None:
+            ans = 0
+        else:
+            ans = row[0]
 
-        ans = row[0]
         if isinstance(ans, float):
             ans = round(ans, 2)
         elif isinstance(ans, str):
             ans = ans.strip()
 
-        print(f"Calculated answer: {ans}")
+        print(f"Answer: {ans}")
         return {"answer": ans}
 
     except Exception as exc:
